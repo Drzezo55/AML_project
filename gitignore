@@ -1,0 +1,27 @@
+# Large data files
+*.RData
+*.RDataTmp
+*.tar
+*.csv
+*.csv.gz
+*.tsv
+*.tsv.gz
+*.h5
+*.loom
+*.rds
+*.bam
+*.fastq
+*.fq
+*.vcf
+
+# R project metadata
+.RData
+.RHistory
+.Rproj.user/
+*.Rproj
+
+# Avoid temporary files
+*.tmp
+*.bak
+*.swp
+
