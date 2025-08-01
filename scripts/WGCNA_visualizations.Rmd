@@ -1,0 +1,505 @@
+---
+title: "WGCNA visualizations"
+author: "Menna Arafat"
+date: "2024-3-10"
+output: html_document
+---
+
+## create directtories`
+
+```{r}
+suppressPackageStartupMessages({ 
+  
+library(tidyr)
+library(purrr)
+library(tibble)
+library(tidyverse)
+library(gridExtra)
+library(gtools)
+library(pROC)
+library(ape)
+library(ggdendro)
+library(WGCNA)
+library(stats)
+library(flashClust)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(tidyverse)
+library(gridExtra)
+library(gplots)
+library(ggplot2)
+library(circlize)
+library(ComplexHeatmap)
+allowWGCNAThreads()          # allow multi-threading (optional)
+
+})
+
+```
+## load data
+
+```{r}
+
+rownames(df)
+row.names(df) <- str_replace(row.names(df), "\\.\\d+$", "")
+gene_symbols <- mapIds(org.Hs.eg.db,
+                       keys = ens_id,      # ENSG IDs
+                       column = "SYMBOL",
+                       keytype = "ENSEMBL",
+                       multiVals = "first")
+gene_symbols_df <- data.frame(
+  ENSEMBL = names(gene_symbols),
+  SYMBOL = gene_symbols,
+  stringsAsFactors = FALSE
+)
+df <- df %>%
+  mutate(ENSEMBL = rownames(df)) %>%
+  left_join(gene_symbols_df, by = "ENSEMBL") 
+
+# Remove duplicated gene symbols
+df <- df[!duplicated(df$SYMBOL) & !is.na(df$SYMBOL), ]
+
+# Set SYMBOL as row names
+rownames(df) <- df$SYMBOL
+
+# Drop SYMBOL and ENSEMBL columns
+df <- df %>% select(-ENSEMBL, -SYMBOL)
+
+datExpr <- t(df)
+datExpr <- as.data.frame(datExpr)
+datExpr[] <- lapply(datExpr, as.numeric)
+rownames(datExpr) <- colnames(df)  # set sample names
+
+# Prepare metadata
+metadata$cond_binary <- as.numeric(as.character(metadata$three_year_survival))
+metadata$cond_binary_label <- factor(metadata$cond_binary, levels = c(0,1), labels = c("dead", "alive"))
+
+# Align metadata with expression data
+metadata <- metadata[match(rownames(datExpr), metadata$barcode), ]
+# Redefine cond_binary after alignment
+metadata$cond_binary <- as.numeric(as.character(metadata$three_year_survival))
+
+# Filter out samples with NA in cond_binary
+keep_samples <- !is.na(metadata$cond_binary)
+metadata <- metadata[keep_samples, ]
+datExpr <- datExpr[keep_samples, ]
+rownames(metadata) <- rownames(datExpr)
+data <- datExpr  # If 'data' is needed for dendrogram step
+#
+# Align metadata to datExpr
+metadata <- metadata[match(rownames(datExpr), metadata$barcode), ]
+
+# Remove NA samples in cond_binary
+keep_samples <- !is.na(metadata$cond_binary)
+datExpr <- datExpr[keep_samples, ]
+metadata <- metadata[keep_samples, ]
+data <- datExpr  
+
+# A. we will work on highly variable genes acorss samples to reduce size
+# A. Calculate variance for each gene (MARGIN = 2 for columns)
+vars <- apply(datExpr, 2, var)
+
+# B. Get the names of the top 1000 most variable genes
+top_genes <- names(sort(vars, decreasing = TRUE))[1:1000]
+
+# C. Filter the expression matrix to keep only these top genes
+datExpr_filtered <- datExpr[, top_genes]
+# working on informative subset of data due to memory issues only
+
+```
+
+
+
+
+
+
+
+```{r}
+
+#parameters for WGCNA
+power= 9  #we raise the adjacency matrix to this power to get rid of weak edges, hence emphasizing only strong correlations and ensure that the network degree follow a scale free distribution, recommended to be less than 15 for unsigned or signed hybrid networks, and less than 30 for signed networks  
+minModuleSize = 25 # minimum module size is the minimum number of genes per module usually (minModuleSize = 50)
+networkType = "signed" #as for unsigned network, negative correlations are treated the same as positive correlations. While for signed network, it gives more weight to positive correlations and consider negative correlations irrelevant.
+gsg = goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  # Remove bad samples or genes
+  if (sum(!gsg$goodGenes) > 0)
+    print(paste("Removing genes:", paste(colnames(datExpr)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples) > 0)
+    print(paste("Removing samples:", paste(rownames(datExpr)[!gsg$goodSamples], collapse = ", ")))
+  
+  datExpr = datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+#Run WGCNA
+net = blockwiseModules(datExpr, 
+                       corType = "pearson", 
+                       maxBlockSize = 5000,
+                       networkType = "signed", 
+                       power = power, 
+                       minModuleSize = minModuleSize,
+                       mergeCutHeight = 0.25, 
+                       numericLabels = FALSE, 
+                       saveTOMs = TRUE, 
+                       pamRespectsDendro = FALSE, 
+                       saveTOMFileBase = "TOM")
+
+
+
+
+
+```
+
+## plot dendrogram of modules and heatmap of associated traits/ phenotypes
+```{r}
+# A. Sanity check: Ensure data is in the right orientation
+if (nrow(data) > ncol(data)) {
+  # Transpose if genes are rows
+  data <- t(data)
+}
+
+# B. Calculate the sample-to-sample distance matrix directly
+# This creates a small, memory-safe vector of distances.
+distance_matrix <- dist(data, method = "euclidean")
+
+# C. Build the sample dendrogram from the distance matrix.
+# This avoids the large 'A' matrix entirely.
+sampleTree <- flashClust(distance_matrix, method = "average")
+
+# D. Calculate connectivity (k) and identify outliers.
+# This uses a small adjacency matrix derived from the distance matrix.
+small_adjacency_matrix <- 1 - as.matrix(distance_matrix)
+k <- apply(small_adjacency_matrix, 2, sum) - 1
+Z.k <- scale(k)
+
+thresholdZ.k <- -5
+outlierColor <- ifelse(Z.k < thresholdZ.k, "red", "black")
+
+# E. Convert traits to a color representation.
+traitColors <- data.frame(numbers2colors(as.numeric(metadata$cond_binary), signed = TRUE))
+colnames(traitColors) <- "Condition"
+
+# F. Combine outlier and trait colors.
+# This line is now fixed
+datColors <- data.frame(outlier_Samples = outlierColor, Condition = traitColors$Condition)
+rownames(datColors) <- rownames(data)
+
+# G. Plot and save dendrogram with trait and outlier colors
+png("results/WGCNA_dendrogram.png", width = 8000, height = 6000, res = 600)
+plotDendroAndColors(
+    dendro = sampleTree,
+    groupLabels = names(datColors),
+    colors = datColors,
+    cex.rowText = 5,
+    main = "Sample dendrogram and Homogeneity of samples heatmap"
+)
+dev.off()
+
+
+```
+## Plot the dendrogram and the module colors before and after merging underneath
+
+```{r}
+# Load required libraries
+library(WGCNA)
+library(flashClust)
+library(grDevices)
+
+# Turn off WGCNA threads to avoid potential conflicts in RStudio
+enableWGCNAThreads()
+
+# Assumes: 
+# - 'data' is expression matrix with **samples as rows**, **genes as columns**
+# - 'metadata' contains condition info for each sample in the same order
+
+# 1. Build adjacency matrix between samples (distance-based)
+A <- adjacency(data, type = "distance")
+
+# 2. Calculate network connectivity per sample
+k <- apply(A, 2, sum) - 1  # subtract self-connection
+Z.k <- scale(k)  # standardize
+
+# 3. Identify outliers
+thresholdZ.k <- -5  # adjust if needed
+outlierColor <- ifelse(Z.k < thresholdZ.k, "red", "black")
+
+# 4. Build sample dendrogram
+sampleTree <- flashClust(as.dist(1 - A), method = "average")
+
+# 5. Map metadata condition to colors
+# Assuming `metadata$cond_binary` contains 0/1 labels per sample
+traitColors <- data.frame(numbers2colors(as.numeric(metadata$cond_binary), signed = TRUE))
+colnames(traitColors) <- "Condition"
+
+# Combine outlier color info and condition trait color
+datColors <- data.frame(Outliers = outlierColor, Condition = traitColors$Condition)
+rownames(datColors) <- rownames(data)  # Ensure row names match samples
+
+# 6. Plot and save dendrogram with trait and outlier colors
+pdf("results/WGCNA_dendrogram.pdf", width = 12, height = 10)
+plotDendroAndColors(
+  dendro = sampleTree,
+  colors = datColors,
+  groupLabels = colnames(datColors),
+  cex.rowText = 1.0,
+  main = "Sample Dendrogram and Trait Heatmap"
+)
+dev.off()
+
+```
+
+
+
+```{r}
+library(here)
+here()
+png("results/dendrogram_merged_modules.png", width = 2200, height = 2500, res= 600)
+plotDendroAndColors(net$dendrograms[[1]], 
+                    labels2colors(net$colors), 
+                    "Module colors",
+                    dendroLabels = FALSE,
+                    addGuide = TRUE,
+                    hang = 0.03,
+                    cex.colorLabels = 0.6,
+                    guideHang = 0.05)
+
+dev.off()
+
+
+```
+##  TOM plot/ heatmap of modules for all proteins
+
+```{r}
+
+
+# B. Recalculate a new dissimilarity TOM for only this subset of genes.
+# This ensures that your matrix is the correct size.
+dissTOM_sub = 1 - TOMsimilarityFromExpr(datExpr_filtered, power = power)
+
+# C. Recalculate a new dendrogram and get the module colors for only this subset.
+dendro_sub = flashClust(as.dist(dissTOM_sub), method = "average")
+moduleColors_sub = moduleColorsAutomatic[select]
+
+# D. Plot the TOM for the subset.
+myheatcol = colorpanel(250, 'red', "orange", 'lemonchiffon')
+TOMplot(dissTOM_sub, dendro_sub, moduleColors_sub,
+        col = myheatcol,
+        main = "Module Heatmap Plot, Subsampled Proteins")
+
+# If you want to save the plot to a file, use the following:
+png("TOM_plot_subsampled.png", width = 1200, height = 1200, res = 150)
+TOMplot(dissTOM_sub, dendro_sub, moduleColors_sub,
+        col = myheatcol,
+         main = "Module Heatmap Plot, Subsampled Proteins")
+dev.off()
+
+```
+
+## Module trait correlation heatmap plot
+```{r, results = FALSE}
+
+# Next use a single trait/variable or the whole metadata binarized to define the module significance 
+#what module associated to what phenotype
+#trait= metadata$diabetes
+
+traits <- metadata %>% select(cond_binary)
+traits <- as.data.frame(traits)
+rownames(traits) <- rownames(metadata)
+
+# Define numbers of genes and samples
+nSamples <- nrow(datExpr_filtered)
+nGenes <- ncol(datExpr_filtered)
+module_eigengenes= read.csv("results/module_eigengenes.csv") %>% column_to_rownames("X")
+module.trait.corr <- WGCNA::cor(module_eigengenes, traits, use = 'p')
+module.trait.corr.pvals <- corPvalueStudent(module.trait.corr, nSamples)
+
+#module_trait heatmap of WGCNA package
+# correlations and their p-values
+png("results/heatmap_module_trait_cor.png", width = 6000, height = 8000, res= 600) 
+textMatrix = paste(signif(module.trait.corr, 2), "\n(", signif(module.trait.corr.pvals, 1), ")", 
+                   sep = "")
+dim(textMatrix) = dim(module.trait.corr)
+par(mar = c(9, 9, 5, 6))
+color= colorpanel(250,"#B0C4DE","#F7F5F4", "orange" )
+#get shades of a color
+colfunc <-colorRampPalette(c("#F7F5F4" , "orange"),  alpha=T)
+color= colfunc(10)
+
+#color= greenWhiteRed(50)
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = module.trait.corr,  xLabels = colnames(traits),
+               yLabels = names(module_eigengenes), 
+               ySymbols = names(module_eigengenes), colorLabels = FALSE, colors = color, 
+               textMatrix = textMatrix, setStdMargins = T, cex.text = 0.8,
+               zlim = c(-1, 1),xColorWidth = 1 * strheight("M"),
+               yColorWidth = 1.5 * strwidth("M"),xColorOffset = strheight("M")/6, 
+               yColorOffset = strwidth("M")/6, font.lab.x = 2, cex.legendLabel = .4,
+               font.lab.y = 2, xLabelsAngle = 45,
+               main = paste("Module-Condition Relationship"), plotLegend= TRUE)
+
+dev.off()
+```
+
+## chord plot of hubproteins
+```{r}
+
+hubs= read.csv("results/phenotype_cor_hubs.csv")
+
+#build similarity/ design matrix
+keydrivers= unlist(hubs) %>% unique(.) %>% .[. != ""]
+mtx= matrix(nrow= ncol(hubs), ncol = length( keydrivers)) #number of all key drivers 
+row.names(mtx)= gsub("_hub", "", names(hubs) )
+colnames(mtx)= paste0(keydrivers)
+
+#colnames of matrix included in keydrivers specified for certain module/ phenotype(rows) then put in 1
+mod= apply(hubs, 2, function(x) as.list(x))
+
+for (i in seq_along(mod)){
+  for (j in 1:ncol(mtx)) {
+    if ( colnames(mtx)[j] %in% mod[[i]] ) {
+      mtx[i, j] <- 1
+    } else {
+      mtx[i, j] <- 0
+    }
+  }
+}
+
+library(circlize)
+```
+
+
+
+
+
+
+
+
+## visualize chordplot
+```{r}
+png("results/chord_plot_hubproteins.png", width = 10000, height = 10000, res = 600)
+# WGCNA Workflow: Corrected and Complete Code
+
+
+# 0. Load necessary libraries (if not already loaded)
+library(WGCNA)
+library(RColorBrewer)
+library(circlize)
+
+# The `top_expr` object is assumed to be your original, unfiltered expression data
+# with samples in rows and genes in columns.
+
+# Step 1: Filter the expression data to keep only the top N most variable genes.
+# This is the crucial step to prevent the memory error.
+
+
+
+# Step 2: Now that the data is filtered, calculate the gene-gene adjacency matrix.
+# This matrix will be square, with rows and columns both representing genes.
+# The 'type' parameter can be 'unsigned', 'signed', or 'distance'.
+gene_adjacency_matrix <- adjacency(datExpr_filtered, type = "distance")
+
+
+# Step 3: Plot the chord diagram using the new, smaller adjacency matrix.
+# First, calculate connectivity from this matrix to find the most connected genes.
+gene_connectivity <- rowSums(gene_adjacency_matrix)
+
+# Get the top N genes based on connectivity for the plot.
+n_plot_genes <- 50
+top_genes_plot <- names(sort(gene_connectivity, decreasing = TRUE))[1:n_plot_genes]
+
+# Create a small matrix for plotting.
+adj_matrix_small <- gene_adjacency_matrix[top_genes_plot, top_genes_plot]
+
+
+# Step 4: Set up the colors and plotting parameters.
+circos.par(gap.degree = 1,
+           track.margin = c(0.05, 0.05),
+           points.overflow.warning = FALSE)
+
+palt <- colorRampPalette(c("#F6E8C3", "#B0C4DE", "#E3B31C", "tan", "purple", "#523375" , "maroon3" , "#21908CFF" , "darkgrey",  "deepskyblue4"))
+grid.col <- palt(dim(adj_matrix_small)[1])
+names(grid.col) <- rownames(adj_matrix_small)
+
+# Plot the chord diagram with the small matrix.
+chordDiagram(adj_matrix_small,
+             annotationTrack = "grid",
+             transparency = 0.5,
+             grid.col = grid.col)
+
+# Add labels
+circos.clear()
+circos.par(gap.degree = 1,
+           track.margin = c(0.05, 0.05),
+           points.overflow.warning = FALSE)
+chordDiagram(adj_matrix_small,
+             annotationTrack = "grid",
+             transparency = 0.5,
+             grid.col = grid.col)
+circos.track(track.index = 1, panel.fun = function(x, y) {
+  circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, 
+              facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5), cex = 0.8)
+}, bg.border = NA)
+dev.off()
+
+```
+
+
+```{r}
+moduleColorsAutomatic <- net$colors
+standardColors <- labels2colors(moduleColorsAutomatic)
+# Recalculate the module eigengenes using standard module colors
+MEs <- moduleEigengenes(datExpr_filtered, colors = standardColors)$eigengenes
+
+# Now calculate module membership (kME) using the correct argument name
+datKME <- signedKME(datExpr_filtered, MEs)
+
+colorOfColumn <- substring(names(datKME), 4)
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+names(traits) <- "pertubation_lvl"
+trait <- as.data.frame(traits$perturbation_lvl)
+# Calculate Gene Significance (GS) as the correlation between gene expression
+# and the external trait (pertubation_lvl).
+# The datExpr_filtered object from our previous discussion should be used here.
+GS.lvl <- as.numeric(cor(datExpr_filtered, traits, use = "p"))
+
+#Intramodular analysis: identifying genes with high GS and MM
+png("mm_vs_sig.png", width = 800, height = 600)
+# Calculate gene significance for the trait of interest
+
+colorOfColumn = substring(names(datKME), 4)
+par(mar = c(5, 4, 4, 2) + 0.1) 
+par(mfrow = c(2, 2))
+selectModules = c( "brown","blue", "bisque4", "black")
+par(mfrow = c(2, length(selectModules)/2))
+for (module in selectModules) {
+  column = match(module, colorOfColumn)
+  restModule = moduleColorsAutomatic == module
+  verboseScatterplot(datKME[restModule, column], GS.lvl[restModule],
+                     xlab = paste("Module Membership ",
+                                  module, "module"), ylab = "pertubation_lvl", main = paste("kME.", module,
+                                                                                            "vs. gene Sig."), col = module)
+  
+}             
+dev.off() 
+```
+
+
+```{r}
+
+```
+
+
